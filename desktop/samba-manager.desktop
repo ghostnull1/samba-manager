@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Samba Manager
+Comment=Manage Samba shares and users in containerized environments
+Exec=python3 /opt/samba_manager/app.py
+Icon=folder-remote
+Terminal=false
+Categories=System;Settings;

@@ -274,11 +274,6 @@ def dropdown_index(dropdown):
     return -1 if idx == Gtk.INVALID_LIST_POSITION else idx
 
 
-def dropdown_text(dropdown):
-    item = dropdown.get_selected_item()
-    return item.get_string() if item is not None else ''
-
-
 # ---------------------------------------------------------------------------
 # Fatal startup dialog
 # ---------------------------------------------------------------------------
@@ -993,6 +988,7 @@ class SambaManagerApp(Gtk.Application):
         self._initial_force = False
         self.keep_security = False
         self.keep_map_guest = False
+        self.user_candidates = []         # type-ahead suggestions for Add User
         self.window = None
         self.handler = SambaConfigHandler()
         self.builder = Gtk.Builder()
@@ -1102,6 +1098,9 @@ class SambaManagerApp(Gtk.Application):
         if self.keep_security:
             security_items.append(f"Keep existing: security = {existing_sec}")
         set_dropdown_items(b("combo_security"), security_items, 1 if self.keep_security else 0)
+        single = len(security_items) == 1
+        b("combo_security").set_sensitive(not single)      # nothing to choose, so no popup
+        b("combo_security").set_tooltip_text("User-level is the only mode this tool manages" if single else None)
 
         # Map to guest: same idea for values the UI does not offer (e.g. "Bad Uid").
         map_items = ["Never (No guest access)", "Bad User (Standard fallback)", "Bad Password"]
@@ -1167,6 +1166,7 @@ class SambaManagerApp(Gtk.Application):
         self.password_window.set_transient_for(self.window)
         b("pass_btn_cancel").connect("clicked", lambda w: self.password_window.close())
         b("pass_btn_ok").connect("clicked", self.on_password_save_clicked)
+        self.setup_user_suggestions()
 
         self.valid_users_window = b("valid_users_window")
         self.valid_users_window.set_transient_for(self.share_window)
@@ -1544,6 +1544,65 @@ class SambaManagerApp(Gtk.Application):
         except GLib.Error:
             pass
 
+    # -- Add User type-ahead ------------------------------------------------
+
+    MAX_SUGGESTIONS = 8
+
+    def setup_user_suggestions(self):
+        """Entry + popover with a short, filtered suggestion list (scales to any directory size)."""
+        entry = self.builder.get_object("pass_entry_user")
+        self.user_suggest_list = Gtk.ListBox()
+        self.user_suggest_list.set_selection_mode(Gtk.SelectionMode.SINGLE)
+        self.user_suggest_scroll = Gtk.ScrolledWindow()
+        self.user_suggest_scroll.set_propagate_natural_height(True)
+        self.user_suggest_scroll.set_max_content_height(200)
+        self.user_suggest_scroll.set_child(self.user_suggest_list)
+        self.user_popover = Gtk.Popover()
+        self.user_popover.set_parent(entry)
+        self.user_popover.set_has_arrow(False)
+        self.user_popover.set_autohide(False)     # keep keyboard focus in the entry while typing
+        self.user_popover.set_position(Gtk.PositionType.BOTTOM)
+        self.user_popover.set_child(self.user_suggest_scroll)
+        self.user_suggest_list.connect("row-activated", self.on_user_suggestion_activated)
+        entry.connect("changed", self.update_user_suggestions)
+        self.password_window.connect("close-request", self.on_password_window_close)
+
+    def on_password_window_close(self, window):
+        self.user_popover.popdown()
+        return False
+
+    def update_user_suggestions(self, entry):
+        text = entry.get_text().strip().lower()
+        if not entry.get_sensitive() or not text:
+            self.user_popover.popdown()
+            return
+        matches = sorted((u for u in self.user_candidates if text in u.lower()),
+                         key=lambda u: (not u.lower().startswith(text), u.lower()))
+        if not matches or matches == [entry.get_text().strip()]:
+            self.user_popover.popdown()
+            return
+        lb = self.user_suggest_list
+        row = lb.get_row_at_index(0)
+        while row is not None:
+            lb.remove(row)
+            row = lb.get_row_at_index(0)
+        for name in matches[:self.MAX_SUGGESTIONS]:
+            label = Gtk.Label(label=name, xalign=0)
+            label.set_margin_start(6)
+            label.set_margin_end(6)
+            label.set_margin_top(3)
+            label.set_margin_bottom(3)
+            lb.append(label)
+        self.user_suggest_scroll.set_min_content_width(max(entry.get_width(), 150))
+        self.user_popover.popup()
+
+    def on_user_suggestion_activated(self, listbox, row):
+        entry = self.builder.get_object("pass_entry_user")
+        entry.set_text(row.get_child().get_label())
+        entry.set_position(-1)
+        self.user_popover.popdown()
+        self.builder.get_object("pass_entry_pass").grab_focus()
+
     # -- valid users picker -------------------------------------------------
 
     def on_share_pick_valid_clicked(self, widget):
@@ -1670,31 +1729,24 @@ class SambaManagerApp(Gtk.Application):
     def open_password_dialog(self, username):
         b = self.builder.get_object
         if not username:
-            # smbpasswd -a only works for existing Unix accounts: offer exactly those.
+            # Suggestions only: any name that resolves on this system is accepted when saving,
+            # so large or non-enumerated (LDAP/SSSD) directories work too.
             existing = set(model_values(self.store_users))
-            candidates = [u for u in SambaUserManager.get_system_users()
-                          if u != 'root' and u not in existing]
-            if not candidates:
-                self.show_alert("No eligible system users",
-                                "Every regular system account already has a Samba user.\n\n"
-                                "Create the Unix account first (e.g. 'sudo adduser NAME'), "
-                                "then add it here.")
-                return
-            set_dropdown_items(b("pass_dropdown_user"), candidates)
+            self.user_candidates = [u for u in SambaUserManager.get_system_users()
+                                    if u != 'root' and u not in existing]
         b("password_window").set_title('Set User Password' if username else 'Add Samba User')
+        b("pass_entry_user").set_sensitive(not username)
         b("pass_entry_user").set_text(username)
-        b("pass_entry_user").set_visible(bool(username))
-        b("pass_dropdown_user").set_visible(not username)
         b("pass_entry_pass").set_text("")
         b("pass_entry_confirm").set_text("")
         b("password_window").present()
+        if not username:
+            b("pass_entry_user").grab_focus()
 
     def on_password_save_clicked(self, widget):
         b = self.builder.get_object
-        if b("pass_entry_user").get_visible():
-            user = b("pass_entry_user").get_text().strip()
-        else:
-            user = dropdown_text(b("pass_dropdown_user"))
+        user = b("pass_entry_user").get_text().strip()
+        adding = b("pass_entry_user").get_sensitive()
         pw1 = b("pass_entry_pass").get_text()
         pw2 = b("pass_entry_confirm").get_text()
         if not user:
@@ -1706,6 +1758,20 @@ class SambaManagerApp(Gtk.Application):
         if pw1 != pw2:
             self.show_alert("Error", "Passwords do not match.")
             return
+        if adding:
+            try:
+                pwd.getpwnam(user)
+            except KeyError:
+                self.show_alert("Error", f"There is no system account named '{user}'.\n\n"
+                                         f"Create it first (e.g. 'sudo adduser {user}'), then add it here.")
+                return
+            if user == 'root':
+                self.show_alert("Error", "Adding 'root' as a Samba user is not allowed here.")
+                return
+            if user in model_values(self.store_users):
+                self.show_alert("Error", f"'{user}' is already a Samba user. "
+                                         "Select it in the list and use Change Password.")
+                return
         try:
             SambaUserManager.set_password(user, pw1)
         except Exception as e:

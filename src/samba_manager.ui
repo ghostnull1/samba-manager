@@ -364,13 +364,7 @@
           <object class="GtkGrid">
             <property name="row-spacing">10</property><property name="column-spacing">12</property>
             <child><object class="GtkLabel"><property name="label">Username:</property><property name="xalign">1</property><layout><property name="column">0</property><property name="row">0</property></layout></object></child>
-            <child>
-              <object class="GtkBox"><property name="orientation">vertical</property><property name="hexpand">true</property>
-                <child><object class="GtkEntry" id="pass_entry_user"><property name="sensitive">false</property></object></child>
-                <child><object class="GtkDropDown" id="pass_dropdown_user"><property name="enable-search">true</property></object></child>
-                <layout><property name="column">1</property><property name="row">0</property></layout>
-              </object>
-            </child>
+            <child><object class="GtkEntry" id="pass_entry_user"><property name="hexpand">true</property><property name="placeholder-text">Type to search system accounts</property><layout><property name="column">1</property><property name="row">0</property></layout></object></child>
 
             <child><object class="GtkLabel"><property name="label">Password:</property><property name="xalign">1</property><layout><property name="column">0</property><property name="row">1</property></layout></object></child>
             <child><object class="GtkPasswordEntry" id="pass_entry_pass"><property name="show-peek-icon">true</property><property name="hexpand">true</property><layout><property name="column">1</property><property name="row">1</property></layout></object></child>

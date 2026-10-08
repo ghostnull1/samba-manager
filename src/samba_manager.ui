@@ -10,7 +10,7 @@
     <child>
       <object class="GtkBox">
         <property name="orientation">vertical</property>
-        
+
         <child>
           <object class="GtkNotebook" id="notebook">
             <property name="vexpand">true</property>
@@ -29,19 +29,13 @@
                     <child>
                       <object class="GtkActionBar">
                         <child type="start">
-                          <object class="GtkButton" id="btn_add_share">
-                            <property name="label">Add Share</property>
-                          </object>
+                          <object class="GtkButton" id="btn_add_share"><property name="label">Add Share</property></object>
                         </child>
                         <child type="start">
-                          <object class="GtkButton" id="btn_edit_share">
-                            <property name="label">Edit Selected</property>
-                          </object>
+                          <object class="GtkButton" id="btn_edit_share"><property name="label">Edit Selected</property></object>
                         </child>
                         <child type="start">
-                          <object class="GtkButton" id="btn_delete_share">
-                            <property name="label">Delete Selected</property>
-                          </object>
+                          <object class="GtkButton" id="btn_delete_share"><property name="label">Delete Selected</property></object>
                         </child>
                       </object>
                     </child>
@@ -79,7 +73,7 @@
                       <object class="GtkGrid">
                         <property name="row-spacing">15</property>
                         <property name="column-spacing">15</property>
-                        
+
                         <child>
                           <object class="GtkLabel"><property name="label">Workgroup:</property><property name="xalign">1</property>
                             <layout><property name="column">0</property><property name="row">0</property></layout>
@@ -108,7 +102,7 @@
                           </object>
                         </child>
                         <child>
-                          <object class="GtkComboBoxText" id="combo_security">
+                          <object class="GtkDropDown" id="combo_security">
                             <property name="hexpand">true</property>
                             <layout><property name="column">1</property><property name="row">2</property></layout>
                           </object>
@@ -120,7 +114,7 @@
                           </object>
                         </child>
                         <child>
-                          <object class="GtkComboBoxText" id="combo_map_guest">
+                          <object class="GtkDropDown" id="combo_map_guest">
                             <property name="hexpand">true</property>
                             <layout><property name="column">1</property><property name="row">3</property></layout>
                           </object>
@@ -136,7 +130,7 @@
                             <layout><property name="column">1</property><property name="row">4</property></layout>
                           </object>
                         </child>
-                        
+
                       </object>
                     </child>
                   </object>
@@ -205,12 +199,8 @@
                       <object class="GtkBox">
                         <property name="orientation">horizontal</property>
                         <property name="spacing">10</property>
-                        <child>
-                          <object class="GtkLabel"><property name="label">Daemon Status:</property></object>
-                        </child>
-                        <child>
-                          <object class="GtkLabel" id="lbl_status_val"></object>
-                        </child>
+                        <child><object class="GtkLabel"><property name="label">Daemon Status:</property></object></child>
+                        <child><object class="GtkLabel" id="lbl_status_val"></object></child>
                       </object>
                     </child>
                     <child>
@@ -277,7 +267,7 @@
   <!-- Share Window (Hidden Dialog) -->
   <object class="GtkWindow" id="share_window">
     <property name="title">Edit Share</property>
-    <property name="default-width">580</property>
+    <property name="default-width">600</property>
     <property name="modal">true</property>
     <property name="hide-on-close">true</property>
     <child>
@@ -294,10 +284,10 @@
             <property name="column-spacing">12</property>
             <property name="hexpand">true</property>
 
-            <!-- Name -->
+            <!-- Row 0: Name -->
             <child><object class="GtkLabel"><property name="label">Share Name:</property><property name="xalign">1</property><layout><property name="column">0</property><property name="row">0</property></layout></object></child>
             <child><object class="GtkEntry" id="share_entry_name"><property name="hexpand">true</property><layout><property name="column">1</property><property name="row">0</property></layout></object></child>
-            <!-- Path -->
+            <!-- Row 1: Path -->
             <child><object class="GtkLabel"><property name="label">Directory Path:</property><property name="xalign">1</property><layout><property name="column">0</property><property name="row">1</property></layout></object></child>
             <child>
               <object class="GtkBox"><property name="orientation">horizontal</property><property name="spacing">5</property>
@@ -307,37 +297,41 @@
                 <layout><property name="column">1</property><property name="row">1</property></layout>
               </object>
             </child>
-            <!-- Comment -->
-            <child><object class="GtkLabel"><property name="label">Comment:</property><property name="xalign">1</property><layout><property name="column">0</property><property name="row">2</property></layout></object></child>
-            <child><object class="GtkEntry" id="share_entry_comment"><property name="hexpand">true</property><layout><property name="column">1</property><property name="row">2</property></layout></object></child>
-            <!-- Switches -->
-            <child><object class="GtkLabel"><property name="label">Read Only:</property><property name="xalign">1</property><layout><property name="column">0</property><property name="row">3</property></layout></object></child>
-            <child><object class="GtkSwitch" id="share_switch_readonly"><property name="halign">start</property><layout><property name="column">1</property><property name="row">3</property></layout></object></child>
-            <child><object class="GtkLabel"><property name="label">Browseable:</property><property name="xalign">1</property><layout><property name="column">0</property><property name="row">4</property></layout></object></child>
-            <child><object class="GtkSwitch" id="share_switch_browseable"><property name="halign">start</property><layout><property name="column">1</property><property name="row">4</property></layout></object></child>
-            <child><object class="GtkLabel"><property name="label">Guest Access:</property><property name="xalign">1</property><layout><property name="column">0</property><property name="row">5</property></layout></object></child>
-            <child><object class="GtkSwitch" id="share_switch_guest"><property name="halign">start</property><layout><property name="column">1</property><property name="row">5</property></layout></object></child>
-            <!-- Perms -->
-            <child><object class="GtkLabel"><property name="label">Create Mask (Files):</property><property name="xalign">1</property><layout><property name="column">0</property><property name="row">6</property></layout></object></child>
-            <child><object class="GtkComboBoxText" id="share_combo_file_perms"><property name="hexpand">true</property><layout><property name="column">1</property><property name="row">6</property></layout></object></child>
-            <child><object class="GtkLabel"><property name="label">Directory Mask:</property><property name="xalign">1</property><layout><property name="column">0</property><property name="row">7</property></layout></object></child>
-            <child><object class="GtkComboBoxText" id="share_combo_dir_perms"><property name="hexpand">true</property><layout><property name="column">1</property><property name="row">7</property></layout></object></child>
-            <!-- Valid Users -->
-            <child><object class="GtkLabel"><property name="label">Valid Users:</property><property name="xalign">1</property><layout><property name="column">0</property><property name="row">8</property></layout></object></child>
+            <!-- Row 2: Path warning -->
+            <child><object class="GtkLabel" id="share_lbl_path_warning"><property name="xalign">0</property><property name="wrap">true</property><property name="visible">false</property><layout><property name="column">1</property><property name="row">2</property></layout></object></child>
+            <!-- Row 3: Comment -->
+            <child><object class="GtkLabel"><property name="label">Comment:</property><property name="xalign">1</property><layout><property name="column">0</property><property name="row">3</property></layout></object></child>
+            <child><object class="GtkEntry" id="share_entry_comment"><property name="hexpand">true</property><layout><property name="column">1</property><property name="row">3</property></layout></object></child>
+            <!-- Rows 4-6: Switches -->
+            <child><object class="GtkLabel"><property name="label">Read Only:</property><property name="xalign">1</property><layout><property name="column">0</property><property name="row">4</property></layout></object></child>
+            <child><object class="GtkSwitch" id="share_switch_readonly"><property name="halign">start</property><layout><property name="column">1</property><property name="row">4</property></layout></object></child>
+            <child><object class="GtkLabel"><property name="label">Browseable:</property><property name="xalign">1</property><layout><property name="column">0</property><property name="row">5</property></layout></object></child>
+            <child><object class="GtkSwitch" id="share_switch_browseable"><property name="halign">start</property><layout><property name="column">1</property><property name="row">5</property></layout></object></child>
+            <child><object class="GtkLabel"><property name="label">Guest Access:</property><property name="xalign">1</property><layout><property name="column">0</property><property name="row">6</property></layout></object></child>
+            <child><object class="GtkSwitch" id="share_switch_guest"><property name="halign">start</property><layout><property name="column">1</property><property name="row">6</property></layout></object></child>
+            <!-- Rows 7-9: Permissions -->
+            <child><object class="GtkLabel"><property name="label">Create Mask (Files):</property><property name="xalign">1</property><layout><property name="column">0</property><property name="row">7</property></layout></object></child>
+            <child><object class="GtkDropDown" id="share_combo_file_perms"><property name="hexpand">true</property><layout><property name="column">1</property><property name="row">7</property></layout></object></child>
+            <child><object class="GtkLabel"><property name="label">Directory Mask:</property><property name="xalign">1</property><layout><property name="column">0</property><property name="row">8</property></layout></object></child>
+            <child><object class="GtkDropDown" id="share_combo_dir_perms"><property name="hexpand">true</property><layout><property name="column">1</property><property name="row">8</property></layout></object></child>
+            <child><object class="GtkLabel"><property name="label">Force Permissions:</property><property name="xalign">1</property><layout><property name="column">0</property><property name="row">9</property></layout></object></child>
+            <child><object class="GtkSwitch" id="share_switch_force_modes"><property name="halign">start</property><property name="tooltip-text">Advanced: also write "force create mode" and "force directory mode" with the same values, so new files and folders always get at least these permission bits (useful for group-shared folders).</property><layout><property name="column">1</property><property name="row">9</property></layout></object></child>
+            <!-- Row 10: Valid Users -->
+            <child><object class="GtkLabel"><property name="label">Valid Users:</property><property name="xalign">1</property><layout><property name="column">0</property><property name="row">10</property></layout></object></child>
             <child>
               <object class="GtkBox"><property name="orientation">horizontal</property><property name="spacing">5</property>
                 <child><object class="GtkEntry" id="share_entry_valid_users"><property name="placeholder-text">leave blank for all</property><property name="hexpand">true</property></object></child>
                 <child><object class="GtkButton" id="share_btn_pick_valid"><property name="label">Manage Users</property></object></child>
-                <layout><property name="column">1</property><property name="row">8</property></layout>
+                <layout><property name="column">1</property><property name="row">10</property></layout>
               </object>
             </child>
-            <!-- Force User -->
-            <child><object class="GtkLabel"><property name="label">Force User:</property><property name="xalign">1</property><layout><property name="column">0</property><property name="row">9</property></layout></object></child>
+            <!-- Row 11: Force User -->
+            <child><object class="GtkLabel"><property name="label">Force User:</property><property name="xalign">1</property><layout><property name="column">0</property><property name="row">11</property></layout></object></child>
             <child>
               <object class="GtkBox"><property name="orientation">horizontal</property><property name="spacing">5</property>
                 <child><object class="GtkEntry" id="share_entry_force_user"><property name="placeholder-text">leave blank for none</property><property name="hexpand">true</property></object></child>
                 <child><object class="GtkButton" id="share_btn_pick_force"><property name="label">Select User</property></object></child>
-                <layout><property name="column">1</property><property name="row">9</property></layout>
+                <layout><property name="column">1</property><property name="row">11</property></layout>
               </object>
             </child>
           </object>
@@ -370,11 +364,17 @@
           <object class="GtkGrid">
             <property name="row-spacing">10</property><property name="column-spacing">12</property>
             <child><object class="GtkLabel"><property name="label">Username:</property><property name="xalign">1</property><layout><property name="column">0</property><property name="row">0</property></layout></object></child>
-            <child><object class="GtkEntry" id="pass_entry_user"><property name="hexpand">true</property><layout><property name="column">1</property><property name="row">0</property></layout></object></child>
-            
+            <child>
+              <object class="GtkBox"><property name="orientation">vertical</property><property name="hexpand">true</property>
+                <child><object class="GtkEntry" id="pass_entry_user"><property name="sensitive">false</property></object></child>
+                <child><object class="GtkDropDown" id="pass_dropdown_user"><property name="enable-search">true</property></object></child>
+                <layout><property name="column">1</property><property name="row">0</property></layout>
+              </object>
+            </child>
+
             <child><object class="GtkLabel"><property name="label">Password:</property><property name="xalign">1</property><layout><property name="column">0</property><property name="row">1</property></layout></object></child>
             <child><object class="GtkPasswordEntry" id="pass_entry_pass"><property name="show-peek-icon">true</property><property name="hexpand">true</property><layout><property name="column">1</property><property name="row">1</property></layout></object></child>
-            
+
             <child><object class="GtkLabel"><property name="label">Confirm:</property><property name="xalign">1</property><layout><property name="column">0</property><property name="row">2</property></layout></object></child>
             <child><object class="GtkPasswordEntry" id="pass_entry_confirm"><property name="show-peek-icon">true</property><property name="hexpand">true</property><layout><property name="column">1</property><property name="row">2</property></layout></object></child>
           </object>
@@ -393,7 +393,7 @@
   <object class="GtkWindow" id="valid_users_window">
     <property name="title">Manage Valid Users</property>
     <property name="default-width">600</property>
-    <property name="default-height">450</property>
+    <property name="default-height">480</property>
     <property name="modal">true</property>
     <property name="hide-on-close">true</property>
     <child>
@@ -422,6 +422,12 @@
                 <child><object class="GtkColumnView" id="vu_cv_sel"></object></child>
               </object>
             </child>
+          </object>
+        </child>
+        <child>
+          <object class="GtkBox"><property name="orientation">horizontal</property><property name="spacing">5</property>
+            <child><object class="GtkEntry" id="vu_entry_custom"><property name="hexpand">true</property><property name="placeholder-text">Type a name or group by hand, e.g. alice or @staff</property></object></child>
+            <child><object class="GtkButton" id="vu_btn_custom"><property name="label">Add Typed Name</property></object></child>
           </object>
         </child>
         <child>

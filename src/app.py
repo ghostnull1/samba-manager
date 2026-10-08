@@ -13,21 +13,30 @@
 """Samba Share Configuration Manager.
 
 Requirements:
-  * Python 3 with PyGObject and GTK >= 4.10 (Gtk.AlertDialog / Gtk.FileDialog)
+  * Python 3 with PyGObject and GTK >= 4.10 (Gtk.AlertDialog / Gtk.FileDialog / Gtk.DropDown)
   * configupdater  (pip install configupdater --break-system-packages)
   * Samba tools on PATH: testparm, smbpasswd, pdbedit, smbcontrol
+  * polkit's pkexec (only when NOT running as root)
   * samba_manager.ui next to this file
-  * Must run as root, e.g.:  sudo -E python3 /opt/samba_manager/app.py
-    (-E keeps DISPLAY / WAYLAND_DISPLAY / XDG_RUNTIME_DIR so GTK can open a window)
 
-Lists use Gtk.ColumnView on Gio.ListStore models. The columns are created in
-Python; samba_manager.ui only declares the GtkColumnView widgets.
+Privilege model:
+  The GUI runs as your normal user. Everything that needs root (writing smb.conf,
+  Samba users, service control, creating share directories) is done by a small
+  helper: this same file started as `pkexec python3 app.py --helper`. One helper
+  process is started lazily and reused, so you authenticate once per session.
+  Passwords travel over the helper's stdin pipe, never on a command line.
+  Running the whole app as root (sudo -E python3 app.py) still works; the helper
+  code is then called in-process.
+
+Lists use Gtk.ColumnView on Gio.ListStore models; drop-downs use Gtk.DropDown.
+The columns are created in Python; samba_manager.ui only declares the widgets.
 """
 
 import os
 import re
 import sys
 import glob
+import json
 import shutil
 import signal
 import stat
@@ -36,13 +45,14 @@ import tempfile
 import threading
 import time
 import pwd
+import grp
 
 import gi
 gi.require_version('Gtk', '4.0')
-from gi.repository import Gtk, Gio, GLib, GObject, Pango, Gdk
+from gi.repository import Gtk, Gio, GLib, GObject, Pango
 
 if (Gtk.get_major_version(), Gtk.get_minor_version()) < (4, 10):
-    print("Error: GTK 4.10 or newer is required (Gtk.AlertDialog / Gtk.FileDialog).")
+    print("Error: GTK 4.10 or newer is required.")
     sys.exit(1)
 
 try:
@@ -114,6 +124,15 @@ INVALID_SHARE_CHARS = re.compile(r'[\[\]"/\\:|<>+=;,*?]')
 USERNAME_RE = re.compile(r'^[A-Za-z0-9_][A-Za-z0-9_.\-]*\$?$')
 USER_TOKEN_RE = re.compile(r'[@+&]*(?:"[^"]*"|[^\s,"]+)')
 
+# Samba's own default for "read only" is yes.
+READ_ONLY_DEFAULT = True
+
+DAEMON_UNITS = {'smbd': ('smbd', 'smb')}
+
+# stderr lines from `testparm` that are informational, not warnings.
+TESTPARM_NOISE = ('load smb config files', 'loaded services file ok', 'weak crypto',
+                  'server role:', 'press enter', 'rlimit_max', 'registered MSG_REQ'.lower())
+
 
 # ---------------------------------------------------------------------------
 # Small helpers
@@ -169,8 +188,19 @@ def quote_user(name):
     return name
 
 
+def path_status(path):
+    """'dir', 'file', 'missing' or 'unknown' (e.g. permission denied) for `path`."""
+    try:
+        st = os.stat(path)
+    except FileNotFoundError:
+        return 'missing'
+    except OSError:
+        return 'unknown'
+    return 'dir' if stat.S_ISDIR(st.st_mode) else 'file'
+
+
 # ---------------------------------------------------------------------------
-# List helpers (Gtk.ColumnView + Gio.ListStore)
+# GTK list / drop-down helpers
 # ---------------------------------------------------------------------------
 
 class RowItem(GObject.Object):
@@ -233,43 +263,45 @@ def make_selection(model):
     return Gtk.SingleSelection(model=model, autoselect=False, can_unselect=True)
 
 
+def set_dropdown_items(dropdown, items, selected=0):
+    dropdown.set_model(Gtk.StringList.new(list(items)))
+    dropdown.set_selected(selected)
+
+
+def dropdown_index(dropdown):
+    """Selected index of a Gtk.DropDown, or -1 when nothing is selected."""
+    idx = dropdown.get_selected()
+    return -1 if idx == Gtk.INVALID_LIST_POSITION else idx
+
+
+def dropdown_text(dropdown):
+    item = dropdown.get_selected_item()
+    return item.get_string() if item is not None else ''
+
+
 # ---------------------------------------------------------------------------
-# Root warning
+# Fatal startup dialog
 # ---------------------------------------------------------------------------
 
-def show_root_warning_and_exit():
-    """Displays a graphical error dialog when launched without root, then exits."""
-    app = Gtk.Application(application_id='com.samba.manager.rootwarning')
+def show_fatal_dialog_and_exit(title, text):
+    """Graphical error for problems detected before the main window exists."""
+    app = Gtk.Application(application_id='com.samba.manager.startuperror')
 
     def on_activate(app):
         window = Gtk.ApplicationWindow(application=app)
-        window.set_title("Root Privileges Required")
+        window.set_title(title)
         window.set_default_size(460, 190)
         window.set_resizable(False)
-
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=15)
-        box.set_margin_start(20)
-        box.set_margin_end(20)
-        box.set_margin_top(20)
-        box.set_margin_bottom(20)
-
-        script = os.path.abspath(__file__)
-        label = Gtk.Label(
-            label="Hey, you need to run this as root!\n\n"
-                  "Samba Share Configuration Manager requires administrator rights "
-                  "to manage shares and services.\n\n"
-                  "Please launch it using:\n"
-                  f"sudo -E python3 {script}\n\n"
-                  "(-E keeps your display environment so the window can open.)"
-        )
+        for side in ('start', 'end', 'top', 'bottom'):
+            getattr(box, f'set_margin_{side}')(20)
+        label = Gtk.Label(label=text)
         label.set_wrap(True)
         label.set_selectable(True)
         box.append(label)
-
         button = Gtk.Button(label="OK, Exit")
         button.connect("clicked", lambda btn: app.quit())
         box.append(button)
-
         window.set_child(box)
         window.present()
 
@@ -301,13 +333,14 @@ class SambaServiceManager:
         return 'smbd'
 
     @staticmethod
-    def is_running():
+    def is_running(daemon='smbd'):
+        """Process-table check (works unprivileged and in containers)."""
         try:
             for pid in os.listdir('/proc'):
                 if pid.isdigit():
                     try:
                         with open(f'/proc/{pid}/comm', 'r') as f:
-                            if f.read().strip() == 'smbd':
+                            if f.read().strip() == daemon:
                                 return True
                     except (FileNotFoundError, PermissionError, ProcessLookupError):
                         continue
@@ -315,11 +348,25 @@ class SambaServiceManager:
             pass
 
         try:
-            if subprocess.run(['pgrep', '-x', 'smbd'], capture_output=True).returncode == 0:
+            if subprocess.run(['pgrep', '-x', daemon], capture_output=True).returncode == 0:
                 return True
         except FileNotFoundError:
             pass
         return False
+
+    @staticmethod
+    def status(daemon='smbd'):
+        """Status for the UI: ask systemd when present, otherwise scan processes."""
+        if SambaServiceManager._has_systemd():
+            for unit in DAEMON_UNITS.get(daemon, (daemon,)):
+                try:
+                    rc = subprocess.run(['systemctl', 'is-active', '--quiet', unit],
+                                        timeout=5, stdin=subprocess.DEVNULL).returncode
+                except (OSError, subprocess.TimeoutExpired):
+                    break
+                if rc == 0:
+                    return True
+        return SambaServiceManager.is_running(daemon)
 
     @staticmethod
     def _terminate_smbd():
@@ -350,6 +397,7 @@ class SambaServiceManager:
 
     @staticmethod
     def execute(action):
+        """Runs as root (inside the helper)."""
         if action == 'restart':
             stop_ok, stop_log = SambaServiceManager.execute('stop')
             if not stop_ok:
@@ -395,7 +443,8 @@ class SambaServiceManager:
         for cmd in commands:
             log += f"Running: {' '.join(cmd)}\n"
             try:
-                result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=60,
+                                        stdin=subprocess.DEVNULL)
             except FileNotFoundError:
                 log += f"-> Command not found: {cmd[0]}\n"
                 continue
@@ -427,17 +476,281 @@ class SambaServiceManager:
 
 
 # ---------------------------------------------------------------------------
-# Samba users
+# Privileged operations (these functions run as root, in the helper process)
+# ---------------------------------------------------------------------------
+
+def _testparm_check(tmp_path):
+    """Run `testparm -s` on a candidate file. Raises if rejected, returns warning text."""
+    try:
+        res = subprocess.run(['testparm', '-s', tmp_path], capture_output=True, text=True,
+                             stdin=subprocess.DEVNULL, timeout=30)
+    except FileNotFoundError:
+        return ''  # testparm not installed: cannot validate
+    if res.returncode != 0:
+        detail = (res.stderr or res.stdout).strip()[:1500]
+        raise RuntimeError("testparm rejected the new configuration; nothing was written.\n\n" + detail)
+    warnings = [ln for ln in res.stderr.splitlines()
+                if ln.strip() and not ln.strip().lower().startswith(TESTPARM_NOISE)]
+    return '\n'.join(warnings)[:1500]
+
+
+def _backup_file(target):
+    backup = f"{target}.bak-{time.strftime('%Y%m%d-%H%M%S')}"
+    shutil.copy2(target, backup)
+    backups = sorted(glob.glob(glob.escape(target) + '.bak-*'))
+    for old in backups[:-MAX_BACKUPS]:
+        try:
+            os.remove(old)
+        except OSError:
+            pass
+    return backup
+
+
+def op_ping():
+    return 'pong'
+
+
+def op_save_conf(path, content):
+    """Atomically write smb.conf: temp file -> testparm -> backup -> replace."""
+    target = os.path.realpath(path)
+    if target != os.path.realpath(DEFAULT_CONF_PATH):
+        raise ValueError(f"Refusing to write anywhere but {DEFAULT_CONF_PATH}.")
+    directory = os.path.dirname(target)
+    os.makedirs(directory, exist_ok=True)
+
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix='.smb.conf.', suffix='.tmp')
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            f.write(content)
+            f.flush()
+            os.fsync(f.fileno())
+
+        if os.path.exists(target):
+            st = os.stat(target)
+            os.chmod(tmp, stat.S_IMODE(st.st_mode))
+            try:
+                os.chown(tmp, st.st_uid, st.st_gid)
+            except OSError:
+                pass  # e.g. proot / unprivileged environments: ownership is best-effort
+        else:
+            os.chmod(tmp, 0o644)
+
+        warnings = _testparm_check(tmp)
+        backup = _backup_file(target) if os.path.exists(target) else None
+        os.replace(tmp, target)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+        raise
+    return {'backup': backup, 'warnings': warnings}
+
+
+def op_reload_conf():
+    if not SambaServiceManager.is_running():
+        return {'status': 'not_running', 'detail': ''}
+    try:
+        res = subprocess.run(['smbcontrol', 'all', 'reload-config'], capture_output=True,
+                             text=True, timeout=30, stdin=subprocess.DEVNULL)
+    except FileNotFoundError:
+        return {'status': 'missing', 'detail': ''}
+    except subprocess.TimeoutExpired:
+        return {'status': 'timeout', 'detail': ''}
+    if res.returncode != 0:
+        return {'status': 'failed', 'detail': (res.stderr or res.stdout).strip()}
+    return {'status': 'ok', 'detail': ''}
+
+
+def op_list_users():
+    try:
+        res = subprocess.run(['pdbedit', '-L'], capture_output=True, text=True, check=True,
+                             stdin=subprocess.DEVNULL)
+    except FileNotFoundError:
+        raise RuntimeError("'pdbedit' was not found. Is Samba installed?")
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError((e.stderr or e.stdout or '').strip() or "pdbedit failed.")
+    return [line.split(':')[0] for line in res.stdout.splitlines() if line.strip()]
+
+
+def op_set_password(username, password):
+    if not USERNAME_RE.match(username or ''):
+        raise ValueError("Invalid username. Use letters, digits, '_', '.', '-' "
+                         "and do not start with '-' or '.'.")
+    if not password:
+        raise ValueError("Password cannot be empty.")
+    if '\n' in password or '\r' in password:
+        raise ValueError("Password cannot contain line breaks.")
+    try:
+        res = subprocess.run(['smbpasswd', '-a', '-s', username],
+                             input=f"{password}\n{password}\n", capture_output=True, text=True)
+    except FileNotFoundError:
+        raise RuntimeError("'smbpasswd' was not found. Is Samba installed?")
+    if res.returncode != 0:
+        raise RuntimeError((res.stderr or res.stdout).strip() or "Failed to set password.")
+
+
+def op_delete_user(username):
+    if not USERNAME_RE.match(username or ''):
+        raise ValueError("Invalid username.")
+    try:
+        res = subprocess.run(['smbpasswd', '-x', username], capture_output=True, text=True,
+                             stdin=subprocess.DEVNULL)
+    except FileNotFoundError:
+        raise RuntimeError("'smbpasswd' was not found. Is Samba installed?")
+    if res.returncode != 0:
+        raise RuntimeError((res.stderr or res.stdout).strip() or "Failed to delete user.")
+
+
+def op_service(action):
+    return list(SambaServiceManager.execute(action))
+
+
+def op_apply_fs(ops):
+    """Create / chmod share directories. New directories are chowned to the force user."""
+    errors = []
+    for op in ops:
+        share, path, mode, owner = op['share'], op['path'], op.get('mode'), op.get('owner')
+        try:
+            if not os.path.isabs(path):
+                raise ValueError("path must be absolute")
+            if os.path.exists(path) and not os.path.isdir(path):
+                raise NotADirectoryError("exists but is not a directory")
+
+            if not os.path.isdir(path):
+                ids = None
+                if owner:
+                    try:
+                        pw = pwd.getpwnam(owner)
+                        ids = (pw.pw_uid, pw.pw_gid)
+                    except KeyError:
+                        errors.append(f"[{share}] force user '{owner}' does not exist; "
+                                      f"{path} will be owned by root.")
+                missing, p = [], path
+                while not os.path.exists(p) and p != os.path.dirname(p):
+                    missing.append(p)
+                    p = os.path.dirname(p)
+                for d in reversed(missing):
+                    os.mkdir(d)
+                    # mkdir(mode=) is umask-filtered, so chmod explicitly.
+                    os.chmod(d, (mode if mode is not None else 0o755) if d == path else 0o755)
+                if ids:
+                    os.chown(path, *ids)
+            elif op.get('chmod_existing') and mode is not None:
+                os.chmod(path, mode)
+        except Exception as e:
+            errors.append(f"[{share}] {path}: {e}")
+    return errors
+
+
+OPS = {
+    'ping': op_ping, 'save_conf': op_save_conf, 'reload_conf': op_reload_conf,
+    'list_users': op_list_users, 'set_password': op_set_password,
+    'delete_user': op_delete_user, 'service': op_service, 'apply_fs': op_apply_fs,
+}
+
+
+def helper_main():
+    """Entry point of `pkexec python3 app.py --helper`: line-delimited JSON on stdin/stdout."""
+    if os.geteuid() != 0:
+        sys.exit("The helper must run as root.")
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            req = json.loads(line)
+            if req.get('op') not in OPS:
+                raise ValueError(f"Unknown operation: {req.get('op')}")
+            result = OPS[req['op']](**req.get('args', {}))
+            resp = {'ok': True, 'result': result}
+        except Exception as e:
+            resp = {'ok': False, 'error': str(e) or e.__class__.__name__}
+        sys.stdout.write(json.dumps(resp) + '\n')
+        sys.stdout.flush()
+
+
+# ---------------------------------------------------------------------------
+# Privilege broker (GUI side)
+# ---------------------------------------------------------------------------
+
+class PrivilegeError(RuntimeError):
+    pass
+
+
+class PrivilegedHelper:
+    """Calls the OPS table as root: in-process when already root, else via one pkexec helper."""
+
+    def __init__(self):
+        self.direct = os.geteuid() == 0
+        self.proc = None
+        self.lock = threading.Lock()
+
+    def call(self, op, **args):
+        if self.direct:
+            return OPS[op](**args)
+        with self.lock:
+            line = ''
+            try:
+                proc = self._ensure()
+                proc.stdin.write(json.dumps({'op': op, 'args': args}) + '\n')
+                proc.stdin.flush()
+                line = proc.stdout.readline()
+            except PrivilegeError:
+                raise
+            except (BrokenPipeError, OSError):
+                pass
+            if not line:
+                self._reset()
+                raise PrivilegeError("Administrator authorization was cancelled or the helper stopped.")
+        resp = json.loads(line)
+        if not resp['ok']:
+            raise RuntimeError(resp['error'])
+        return resp['result']
+
+    def _ensure(self):
+        if self.proc is None or self.proc.poll() is not None:
+            if shutil.which('pkexec') is None:
+                raise PrivilegeError("pkexec (polkit) is not installed. Install polkit, "
+                                     "or run this program as root.")
+            self.proc = subprocess.Popen(
+                ['pkexec', sys.executable, os.path.abspath(__file__), '--helper'],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                text=True, bufsize=1)
+        return self.proc
+
+    def _reset(self):
+        proc, self.proc = self.proc, None
+        if proc is not None:
+            try:
+                proc.stdin.close()
+            except OSError:
+                pass
+
+    def close(self):
+        with self.lock:
+            self._reset()      # EOF on stdin makes the helper exit
+
+
+HELPER = PrivilegedHelper()
+
+
+# ---------------------------------------------------------------------------
+# Samba users / system accounts
 # ---------------------------------------------------------------------------
 
 class SambaUserManager:
     @staticmethod
     def get_users():
-        try:
-            res = subprocess.run(['pdbedit', '-L'], capture_output=True, text=True, check=True)
-            return [line.split(':')[0] for line in res.stdout.splitlines() if line.strip()]
-        except Exception:
-            return []
+        return HELPER.call('list_users')
+
+    @staticmethod
+    def set_password(username, password):
+        HELPER.call('set_password', username=username, password=password)
+
+    @staticmethod
+    def delete_user(username):
+        HELPER.call('delete_user', username=username)
 
     @staticmethod
     def get_system_users():
@@ -451,31 +764,15 @@ class SambaUserManager:
         return sorted(set(users))
 
     @staticmethod
-    def set_password(username, password):
-        if not USERNAME_RE.match(username or ''):
-            raise ValueError("Invalid username. Use letters, digits, '_', '.', '-' "
-                             "and do not start with '-' or '.'.")
-        if not password:
-            raise ValueError("Password cannot be empty.")
-        if '\n' in password or '\r' in password:
-            raise ValueError("Password cannot contain line breaks.")
+    def get_system_groups():
+        groups = []
         try:
-            res = subprocess.run(['smbpasswd', '-a', '-s', username],
-                                 input=f"{password}\n{password}\n",
-                                 capture_output=True, text=True)
-        except FileNotFoundError:
-            raise RuntimeError("'smbpasswd' was not found. Is Samba installed?")
-        if res.returncode != 0:
-            raise RuntimeError((res.stderr or res.stdout).strip() or "Failed to set password.")
-
-    @staticmethod
-    def delete_user(username):
-        try:
-            res = subprocess.run(['smbpasswd', '-x', username], capture_output=True, text=True)
-        except FileNotFoundError:
-            raise RuntimeError("'smbpasswd' was not found. Is Samba installed?")
-        if res.returncode != 0:
-            raise RuntimeError((res.stderr or res.stdout).strip() or "Failed to delete user.")
+            for g in grp.getgrall():
+                if 1000 <= g.gr_gid < 65534 and 'nogroup' not in g.gr_name:
+                    groups.append(g.gr_name)
+        except Exception:
+            pass
+        return sorted(set(groups))
 
 
 # ---------------------------------------------------------------------------
@@ -487,6 +784,7 @@ class SambaConfigHandler:
         self.filepath = filepath
         self.load_error = None
         self.is_new_file = False
+        self._added_sections = set()      # lowercase names of sections created by this app
         self.updater = ConfigUpdater(
             allow_no_value=True,
             delimiters=('=',),            # ':' is legal inside keys, e.g. "fruit:metadata"
@@ -505,91 +803,42 @@ class SambaConfigHandler:
             except Exception as e:
                 self.load_error = f"Could not read or parse {self.filepath}:\n\n{e}"
         else:
-            # Do not silently fall back to ./smb.conf. Start from defaults and
-            # create the real file only when the user saves.
+            # Start from defaults; the real file is created only when the user saves.
             self.is_new_file = True
-            self.updater.add_section('global')
+            self._add_section('global')
             sec = self.updater['global']
             for key, val in (('workgroup', 'WORKGROUP'), ('server string', 'Samba Server'),
                              ('security', 'user'), ('map to guest', 'Bad User'),
                              ('guest account', 'nobody')):
                 self._set_option(sec, key, val)
 
+    def _add_section(self, name):
+        self.updater.add_section(name)
+        self._added_sections.add(name.lower())
+
     def _render(self):
-        lines = str(self.updater).splitlines()
+        """Render the file, keeping the user's formatting.
+
+        Only sections created by this app get a separating blank line, so comments
+        that sit directly above an existing [section] header are never pulled apart.
+        """
         out = []
-        for line in lines:
-            # Keep the user's formatting, comments and continuation lines intact;
-            # only make sure newly added sections are separated by a blank line.
-            if (line.lstrip().startswith('[') and out and out[-1].strip() != ''
-                    and not out[-1].rstrip().endswith('\\')):
+        for line in str(self.updater).splitlines():
+            m = re.match(r'^\s*\[(.+?)\]\s*$', line)
+            if (m and m.group(1).lower() in self._added_sections and out
+                    and out[-1].strip() != '' and not out[-1].rstrip().endswith('\\')):
                 out.append('')
             out.append(line)
         return '\n'.join(out).rstrip('\n') + '\n'
 
-    @staticmethod
-    def _validate(tmp_path):
-        """Run `testparm -s` on the candidate file. Raises if Samba rejects it."""
-        try:
-            res = subprocess.run(['testparm', '-s', tmp_path], capture_output=True, text=True,
-                                 stdin=subprocess.DEVNULL, timeout=30)
-        except FileNotFoundError:
-            return  # testparm not installed: cannot validate
-        if res.returncode != 0:
-            detail = (res.stderr or res.stdout).strip()[:1500]
-            raise RuntimeError("testparm rejected the new configuration; nothing was written.\n\n" + detail)
-
-    @staticmethod
-    def _backup(target):
-        backup = f"{target}.bak-{time.strftime('%Y%m%d-%H%M%S')}"
-        shutil.copy2(target, backup)
-        backups = sorted(glob.glob(glob.escape(target) + '.bak-*'))
-        for old in backups[:-MAX_BACKUPS]:
-            try:
-                os.remove(old)
-            except OSError:
-                pass
-        return backup
-
     def save_config(self):
-        """Atomically write smb.conf: temp file -> testparm -> backup -> replace.
+        """Hand the rendered file to the privileged helper.
 
-        Returns the backup path, or None if there was no previous file.
+        Returns {'backup': path or None, 'warnings': testparm warning text}.
         """
-        content = self._render()
-        target = os.path.realpath(self.filepath)
-        directory = os.path.dirname(target)
-        os.makedirs(directory, exist_ok=True)
-
-        fd, tmp = tempfile.mkstemp(dir=directory, prefix='.smb.conf.', suffix='.tmp')
-        try:
-            with os.fdopen(fd, 'w', encoding='utf-8') as f:
-                f.write(content)
-                f.flush()
-                os.fsync(f.fileno())
-
-            if os.path.exists(target):
-                st = os.stat(target)
-                os.chmod(tmp, stat.S_IMODE(st.st_mode))
-                try:
-                    os.chown(tmp, st.st_uid, st.st_gid)
-                except OSError:
-                    pass  # e.g. proot / unprivileged environments: ownership is best-effort
-            else:
-                os.chmod(tmp, 0o644)
-
-            self._validate(tmp)
-
-            backup = self._backup(target) if os.path.exists(target) else None
-            os.replace(tmp, target)
-        except Exception:
-            try:
-                os.unlink(tmp)
-            except FileNotFoundError:
-                pass
-            raise
+        result = HELPER.call('save_conf', path=self.filepath, content=self._render())
         self.is_new_file = False
-        return backup
+        return result
 
     # -- generic option access (alias / whitespace aware) -------------------
 
@@ -620,10 +869,8 @@ class SambaConfigHandler:
         return value
 
     def _set_option(self, section, canonical, value):
-        """Set (str), remove (None) or leave alone (don't call) an option.
-
-        Aliases of the same parameter are removed so no conflicting duplicates remain.
-        """
+        """Set (str) or remove (None) an option; aliases of it are removed so no
+        conflicting duplicates remain."""
         found = self._match(section, canonical)
         canon_norm = norm_key(canonical)
         keep = next((raw for raw, inv in found if not inv and norm_key(raw) == canon_norm), None)
@@ -660,7 +907,7 @@ class SambaConfigHandler:
         """A value of None leaves that setting exactly as it is in the file."""
         name = self._find_section('global')
         if name is None:
-            self.updater.add_section('global')
+            self._add_section('global')
             name = 'global'
         sec = self.updater[name]
         for key, val in (('workgroup', workgroup), ('server string', server_string),
@@ -687,16 +934,18 @@ class SambaConfigHandler:
 
     def add_or_update_share(self, share_name, path, comment, read_only, browsable, guest_ok,
                             valid_users='', force_user='', dir_perms=None, file_perms=None,
-                            old_name=None):
+                            force_modes=False, old_name=None):
         """Create or update a share in place.
 
         Unknown ("custom") options, comments and position are preserved.
-        dir_perms / file_perms: None = leave existing masks untouched, '' = remove, str = set.
+        dir_perms / file_perms: None = leave existing masks (and force modes) untouched,
+        str = set the mask. force_modes additionally writes `force create mode` /
+        `force directory mode` with the same value; when False those are removed.
         old_name: set when renaming; all options are carried over to the new section.
         """
         if old_name and old_name != share_name and old_name in self.updater:
             if share_name not in self.updater:
-                self.updater.add_section(share_name)
+                self._add_section(share_name)
                 old_sec = self.updater[old_name]
                 new_sec = self.updater[share_name]
                 for key in list(old_sec.keys()):
@@ -704,7 +953,7 @@ class SambaConfigHandler:
                     new_sec[key] = val if val is not None else ''
             self.updater.remove_section(old_name)
         elif share_name not in self.updater:
-            self.updater.add_section(share_name)
+            self._add_section(share_name)
 
         sec = self.updater[share_name]
         self._set_option(sec, 'comment', comment or None)
@@ -717,10 +966,10 @@ class SambaConfigHandler:
 
         if file_perms is not None:
             self._set_option(sec, 'create mask', file_perms or None)
-            self._set_option(sec, 'force create mode', file_perms or None)
+            self._set_option(sec, 'force create mode', (file_perms or None) if force_modes else None)
         if dir_perms is not None:
             self._set_option(sec, 'directory mask', dir_perms or None)
-            self._set_option(sec, 'force directory mode', dir_perms or None)
+            self._set_option(sec, 'force directory mode', (dir_perms or None) if force_modes else None)
 
     def delete_share(self, share_name):
         if share_name in self.updater:
@@ -736,9 +985,12 @@ class SambaManagerApp(Gtk.Application):
         super().__init__(application_id='com.samba.manager')
         self.unsaved_changes = False
         self.action_in_progress = False
+        self._status_busy = False
         self.pending_fs = {}              # share name -> deferred directory create/chmod
         self.current_edit_share = ''
+        self._initial_file_idx = 0
         self._initial_dir_idx = 0
+        self._initial_force = False
         self.keep_security = False
         self.keep_map_guest = False
         self.window = None
@@ -751,24 +1003,6 @@ class SambaManagerApp(Gtk.Application):
         if self.window is not None:      # second activation: just raise the window
             self.window.present()
             return
-
-        css_provider = Gtk.CssProvider()
-        css_provider.load_from_data(b"""
-            popover, popover contents, popover listview {
-                min-height: 0px;
-                padding: 2px;
-            }
-            popover contents list {
-                background-color: @theme_bg_color;
-            }
-        """)
-        display = Gdk.Display.get_default()
-        if display:
-            Gtk.StyleContext.add_provider_for_display(
-                display,
-                css_provider,
-                Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
-            )
 
         ui_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "samba_manager.ui")
         self.builder.add_from_file(ui_path)
@@ -792,13 +1026,13 @@ class SambaManagerApp(Gtk.Application):
         self.setup_ui_bindings()
 
         self.refresh_shares_list()
-        self.refresh_users_list()
         self.check_daemon_status()
         GLib.timeout_add_seconds(2, self.check_daemon_status)
 
         self.unsaved_changes = False
         self.update_statusbar()
         self.window.present()
+        self.connect_helper_async()
 
         if self.handler.is_new_file:
             self.show_alert(
@@ -806,13 +1040,37 @@ class SambaManagerApp(Gtk.Application):
                 f"{self.handler.filepath} does not exist.\n\n"
                 "Starting from default settings. The file will be created when you save.")
 
+    def do_shutdown(self):
+        HELPER.close()
+        Gtk.Application.do_shutdown(self)
+
+    def connect_helper_async(self):
+        """Start the privileged helper in the background so the polkit prompt shows at launch."""
+        def work():
+            try:
+                HELPER.call('ping')
+                err = None
+            except Exception as e:
+                err = str(e)
+            GLib.idle_add(self._helper_ready, err)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _helper_ready(self, err):
+        if err:
+            self.show_alert("Administrator access unavailable",
+                            f"{err}\n\nYou can keep editing, but saving, Samba users and service "
+                            "control need administrator rights and will ask again when used.")
+        else:
+            self.refresh_users_list()
+        return False
+
     def setup_ui_bindings(self):
         b = self.builder.get_object
         b("entry_workgroup").connect("changed", self.mark_unsaved)
         b("entry_server_string").connect("changed", self.mark_unsaved)
         b("entry_guest_account").connect("changed", self.mark_unsaved)
-        b("combo_security").connect("changed", self.mark_unsaved)
-        b("combo_map_guest").connect("changed", self.mark_unsaved)
+        b("combo_security").connect("notify::selected", self.mark_unsaved)
+        b("combo_map_guest").connect("notify::selected", self.mark_unsaved)
         b("btn_save").connect("clicked", self.on_save_clicked)
 
         b("btn_add_share").connect("clicked", self.on_add_share_clicked)
@@ -843,12 +1101,7 @@ class SambaManagerApp(Gtk.Application):
         self.keep_security = bool(existing_sec) and existing_sec.lower() != 'user'
         if self.keep_security:
             security_items.append(f"Keep existing: security = {existing_sec}")
-
-        combo_sec = b("combo_security")
-        combo_sec.remove_all()
-        for item in security_items:
-            combo_sec.append_text(item)
-        combo_sec.set_active(1 if self.keep_security else 0)
+        set_dropdown_items(b("combo_security"), security_items, 1 if self.keep_security else 0)
 
         # Map to guest: same idea for values the UI does not offer (e.g. "Bad Uid").
         map_items = ["Never (No guest access)", "Bad User (Standard fallback)", "Bad Password"]
@@ -856,34 +1109,18 @@ class SambaManagerApp(Gtk.Application):
         self.keep_map_guest = cmap not in ('', 'never', 'bad user', 'bad password')
         if self.keep_map_guest:
             map_items.append(f"Keep existing: map to guest = {glob_settings.get('map to guest')}")
-
-        combo_map = b("combo_map_guest")
-        combo_map.remove_all()
-        for item in map_items:
-            combo_map.append_text(item)
+        if self.keep_map_guest:
+            map_sel = 3
+        else:
+            map_sel = {'bad user': 1, 'bad password': 2}.get(cmap, 0)
+        set_dropdown_items(b("combo_map_guest"), map_items, map_sel)
 
         b("entry_workgroup").set_text(glob_settings.get('workgroup') or 'WORKGROUP')
         b("entry_server_string").set_text(glob_settings.get('server string') or 'Samba Server')
         b("entry_guest_account").set_text(glob_settings.get('guest account') or 'nobody')
 
-        if self.keep_map_guest:
-            combo_map.set_active(3)
-        elif cmap == 'bad user':
-            combo_map.set_active(1)
-        elif cmap == 'bad password':
-            combo_map.set_active(2)
-        else:
-            combo_map.set_active(0)
-
-        combo_file = b("share_combo_file_perms")
-        combo_file.remove_all()
-        for label in FILE_MASK_LABELS:
-            combo_file.append_text(label)
-
-        combo_dir = b("share_combo_dir_perms")
-        combo_dir.remove_all()
-        for label in DIR_MASK_LABELS:
-            combo_dir.append_text(label)
+        set_dropdown_items(b("share_combo_file_perms"), FILE_MASK_LABELS)
+        set_dropdown_items(b("share_combo_dir_perms"), DIR_MASK_LABELS)
 
     def setup_lists(self):
         b = self.builder.get_object
@@ -920,8 +1157,11 @@ class SambaManagerApp(Gtk.Application):
         b("share_btn_cancel").connect("clicked", lambda w: self.share_window.close())
         b("share_btn_ok").connect("clicked", self.on_share_save_clicked)
         b("share_btn_browse").connect("clicked", self.on_share_browse_clicked)
+        b("share_btn_open_fm").connect("clicked", self.on_share_open_folder_clicked)
         b("share_btn_pick_valid").connect("clicked", self.on_share_pick_valid_clicked)
         b("share_btn_pick_force").connect("clicked", self.on_share_pick_force_clicked)
+        b("share_entry_path").connect("changed", self.update_path_warning)
+        b("share_entry_name").connect("changed", self.update_path_warning)
 
         self.password_window = b("password_window")
         self.password_window.set_transient_for(self.window)
@@ -950,6 +1190,8 @@ class SambaManagerApp(Gtk.Application):
         b("vu_btn_remove").connect("clicked", self.vu_remove_selected)
         b("vu_btn_add_all").connect("clicked", self.vu_add_all)
         b("vu_btn_remove_all").connect("clicked", self.vu_remove_all)
+        b("vu_btn_custom").connect("clicked", self.vu_add_custom)
+        b("vu_entry_custom").connect("activate", self.vu_add_custom)
 
         self.force_user_window = b("force_user_window")
         self.force_user_window.set_transient_for(self.share_window)
@@ -1026,19 +1268,33 @@ class SambaManagerApp(Gtk.Application):
     # -- service control ----------------------------------------------------
 
     def check_daemon_status(self):
+        """Timer callback: poll in a worker thread so the UI never blocks."""
+        if not self._status_busy:
+            self._status_busy = True
+            threading.Thread(target=self._poll_status, daemon=True).start()
+        return True
+
+    def _poll_status(self):
+        try:
+            smbd = SambaServiceManager.status('smbd')
+        except Exception:
+            smbd = False
+        GLib.idle_add(self._apply_status, smbd)
+
+    def _apply_status(self, smbd):
+        self._status_busy = False
         b = self.builder.get_object
-        running = SambaServiceManager.is_running()
-        if running:
+        if smbd:
             self.lbl_status_val.set_markup("<span foreground='green' weight='bold'>Running</span>")
         else:
             self.lbl_status_val.set_markup("<span foreground='red' weight='bold'>Stopped</span>")
 
         # While an action runs the buttons stay disabled; the timer must not re-enable them.
         if not self.action_in_progress:
-            b("btn_start").set_sensitive(not running)
-            b("btn_stop").set_sensitive(running)
-            b("btn_restart").set_sensitive(running)
-        return True
+            b("btn_start").set_sensitive(not smbd)
+            b("btn_stop").set_sensitive(smbd)
+            b("btn_restart").set_sensitive(smbd)
+        return False
 
     def on_service_action(self, action):
         if self.action_in_progress:
@@ -1052,9 +1308,9 @@ class SambaManagerApp(Gtk.Application):
 
         def run_action_thread():
             try:
-                success, log_output = SambaServiceManager.execute(action)
+                success, log_output = HELPER.call('service', action=action)
             except Exception as e:
-                success, log_output = False, f"Unexpected error: {e}"
+                success, log_output = False, f"Error: {e}"
 
             def update_ui():
                 self.append_log(log_output)
@@ -1073,18 +1329,17 @@ class SambaManagerApp(Gtk.Application):
         for share in self.handler.get_shares():
             d = self.handler.get_share_details(share)
             path = d.get('path', '')
-            dir_perms = d.get('directory mask') or d.get('create mask')
+            dir_perms = d.get('directory mask')
             if not dir_perms and path and os.path.exists(path):
                 try:
                     dir_perms = f"{os.stat(path).st_mode & 0o777:04o}"
                 except Exception:
                     pass
-            mode_str = dir_perms or 'N/A'
             rows.append((
                 share, str(path or 'N/A'),
-                'Yes' if to_bool(d.get('read only'), False) else 'No',
+                'Yes' if to_bool(d.get('read only'), READ_ONLY_DEFAULT) else 'No',
                 'Yes' if to_bool(d.get('guest ok'), False) else 'No',
-                d.get('valid users', '') or 'All', mode_str
+                d.get('valid users', '') or 'All', dir_perms or 'N/A'
             ))
         fill_store(self.store_shares, rows)
         self.update_statusbar()
@@ -1104,7 +1359,7 @@ class SambaManagerApp(Gtk.Application):
         # [homes] / [printers] legitimately have no path: don't invent one when editing.
         b("share_entry_path").set_text(data.get('path', '' if editing else '/home'))
         b("share_entry_comment").set_text(data.get('comment', ''))
-        b("share_switch_readonly").set_active(to_bool(data.get('read only'), False))
+        b("share_switch_readonly").set_active(to_bool(data.get('read only'), READ_ONLY_DEFAULT))
         b("share_switch_browseable").set_active(to_bool(data.get('browseable'), True))
         b("share_switch_guest").set_active(to_bool(data.get('guest ok'), False))
         b("share_entry_valid_users").set_text(data.get('valid users', ''))
@@ -1118,12 +1373,50 @@ class SambaManagerApp(Gtk.Application):
         d_idx = mask_index(data.get('directory mask'), DIR_MASKS)
         if d_idx is None:
             d_idx = len(DIR_MASKS) if editing else 0
+        force = bool(data.get('force create mode') or data.get('force directory mode'))
 
-        b("share_combo_file_perms").set_active(f_idx)
-        b("share_combo_dir_perms").set_active(d_idx)
-        self._initial_dir_idx = d_idx
+        b("share_combo_file_perms").set_selected(f_idx)
+        b("share_combo_dir_perms").set_selected(d_idx)
+        b("share_switch_force_modes").set_active(force)
+        self._initial_file_idx, self._initial_dir_idx, self._initial_force = f_idx, d_idx, force
 
+        self.update_path_warning()
         b("share_window").present()
+
+    def update_path_warning(self, *args):
+        b = self.builder.get_object
+        label = b("share_lbl_path_warning")
+        path = b("share_entry_path").get_text().strip()
+        name = b("share_entry_name").get_text().strip().lower()
+        text = ''
+        if path and name not in SPECIAL_SHARES:
+            if not path.startswith('/'):
+                text = "Path must be absolute (start with '/')."
+            else:
+                state = path_status(path)
+                if state == 'missing':
+                    text = "This directory does not exist yet; it will be created when you save smb.conf."
+                elif state == 'file':
+                    text = "This path exists but is not a directory."
+                elif state == 'unknown':
+                    text = "Cannot check this path with your permissions."
+        label.set_visible(bool(text))
+        label.set_markup(f"<span foreground='#b36b00'>{GLib.markup_escape_text(text)}</span>" if text else '')
+
+    def on_share_open_folder_clicked(self, widget):
+        path = self.builder.get_object("share_entry_path").get_text().strip()
+        if path_status(path) != 'dir':
+            self.show_alert("Cannot open folder", "That directory does not exist yet. "
+                                                  "It is created when you save smb.conf.")
+            return
+        Gtk.FileLauncher.new(Gio.File.new_for_path(path)).launch(self.share_window, None, self._on_launch_done)
+
+    @staticmethod
+    def _on_launch_done(launcher, result):
+        try:
+            launcher.launch_finish(result)
+        except GLib.Error:
+            pass
 
     def on_add_share_clicked(self, widget):
         self.open_share_dialog()
@@ -1182,55 +1475,62 @@ class SambaManagerApp(Gtk.Application):
         if path and not path.startswith('/'):
             self.show_alert("Error", "Directory path must be an absolute path (starting with '/').")
             return
+        if path and not special and path_status(path) == 'file':
+            self.show_alert("Error", f"'{path}' exists but is not a directory.")
+            return
 
-        file_idx = b("share_combo_file_perms").get_active()
-        dir_idx = b("share_combo_dir_perms").get_active()
+        file_idx = dropdown_index(b("share_combo_file_perms"))
+        dir_idx = dropdown_index(b("share_combo_dir_perms"))
         if file_idx < 0:
             file_idx = len(FILE_MASKS)
         if dir_idx < 0:
             dir_idx = len(DIR_MASKS)
+        force = b("share_switch_force_modes").get_active()
         file_perms = FILE_MASKS[file_idx] if file_idx < len(FILE_MASKS) else None   # None = custom
-        dir_perms = DIR_MASKS[dir_idx] if dir_idx < len(DIR_MASKS) else None
+        dir_mode = DIR_MASKS[dir_idx] if dir_idx < len(DIR_MASKS) else None
+        force_user = unquote_user(b("share_entry_force_user").get_text().strip())
+
+        # Only rewrite mask / force options in smb.conf when the user actually changed them.
+        conf_file_perms, conf_dir_perms = file_perms, dir_mode
+        if editing and file_idx == self._initial_file_idx and force == self._initial_force:
+            conf_file_perms = None
+        if editing and dir_idx == self._initial_dir_idx and force == self._initial_force:
+            conf_dir_perms = None
 
         # Filesystem changes are deferred until smb.conf is actually saved.
         self.pending_fs.pop(editing, None)
         self.pending_fs.pop(name, None)
         if path and not special:
             self.pending_fs[name] = {
+                'share': name,
                 'path': path,
-                'mode': int(dir_perms, 8) if dir_perms else None,
+                'mode': int(dir_mode, 8) if dir_mode else None,
+                'owner': force_user or None,
                 # Only touch an existing directory if the user changed the dropdown.
-                'chmod_existing': dir_perms is not None and dir_idx != self._initial_dir_idx,
+                'chmod_existing': dir_mode is not None and dir_idx != self._initial_dir_idx,
             }
 
         self.handler.add_or_update_share(
             name, path, b("share_entry_comment").get_text().strip(),
             b("share_switch_readonly").get_active(), b("share_switch_browseable").get_active(),
             b("share_switch_guest").get_active(), b("share_entry_valid_users").get_text().strip(),
-            b("share_entry_force_user").get_text().strip(), dir_perms, file_perms,
-            old_name=editing or None
+            b("share_entry_force_user").get_text().strip(), conf_dir_perms, conf_file_perms,
+            force_modes=force, old_name=editing or None
         )
         self.mark_unsaved()
         self.refresh_shares_list()
         b("share_window").close()
 
     def apply_pending_fs(self):
-        """Create / chmod share directories. Returns a list of error strings."""
-        errors = []
-        for share, op in list(self.pending_fs.items()):
-            path, mode = op['path'], op['mode']
-            try:
-                if os.path.exists(path) and not os.path.isdir(path):
-                    raise NotADirectoryError("exists but is not a directory")
-                if not os.path.isdir(path):
-                    os.makedirs(path, exist_ok=True)
-                    os.chmod(path, mode if mode is not None else 0o755)   # makedirs(mode=) is umask-filtered
-                elif op['chmod_existing'] and mode is not None:
-                    os.chmod(path, mode)
-            except Exception as e:
-                errors.append(f"[{share}] {path}: {e}")
+        """Create / chmod share directories via the helper. Returns a list of error strings."""
+        if not self.pending_fs:
+            return []
+        ops = list(self.pending_fs.values())
         self.pending_fs.clear()
-        return errors
+        try:
+            return HELPER.call('apply_fs', ops=ops)
+        except Exception as e:
+            return [f"Could not create share directories: {e}"]
 
     def on_share_browse_clicked(self, widget):
         dialog = Gtk.FileDialog()
@@ -1253,12 +1553,14 @@ class SambaManagerApp(Gtk.Application):
             if name not in current:
                 current.append(name)
 
-        all_users = sorted(set(SambaUserManager.get_users()))
-        avail = [(u,) for u in all_users if u not in current]
-        selected = [(u,) for u in all_users if u in current]
-        selected += [(u,) for u in current if u not in all_users]   # @groups and unknown users
+        candidates = sorted(set(model_values(self.store_users)))
+        candidates += [f"@{g}" for g in SambaUserManager.get_system_groups()]
+        avail = [(u,) for u in candidates if u not in current]
+        selected = [(u,) for u in candidates if u in current]
+        selected += [(u,) for u in current if u not in candidates]   # unknown users / other prefixes
         fill_store(self.store_vu_avail, avail)
         fill_store(self.store_vu_sel, selected)
+        self.builder.get_object("vu_entry_custom").set_text("")
 
         self.builder.get_object("valid_users_window").present()
 
@@ -1298,6 +1600,22 @@ class SambaManagerApp(Gtk.Application):
         append_names(self.store_vu_avail, model_values(self.store_vu_sel))
         self.store_vu_sel.remove_all()
 
+    def vu_add_custom(self, widget):
+        """Add a name typed by hand, e.g. `alice`, `@staff`, `+unixgroup` or `&nisgroup`."""
+        entry = self.builder.get_object("vu_entry_custom")
+        name = unquote_user(entry.get_text().strip())
+        if not name:
+            return
+        if ',' in name:
+            self.show_alert("Error", "Add one name at a time (no commas).")
+            return
+        if name not in model_values(self.store_vu_sel):
+            append_names(self.store_vu_sel, [name])
+        pos = store_find(self.store_vu_avail, name)
+        if pos >= 0:
+            self.store_vu_avail.remove(pos)
+        entry.set_text("")
+
     def on_valid_users_apply_clicked(self, widget):
         users = ", ".join(quote_user(n) for n in model_values(self.store_vu_sel))
         self.builder.get_object("share_entry_valid_users").set_text(users)
@@ -1330,7 +1648,12 @@ class SambaManagerApp(Gtk.Application):
     # -- users --------------------------------------------------------------
 
     def refresh_users_list(self):
-        fill_store(self.store_users, [(u,) for u in SambaUserManager.get_users()])
+        try:
+            users = SambaUserManager.get_users()
+        except Exception as e:
+            self.append_log(f"Could not list Samba users: {e}")
+            users = []
+        fill_store(self.store_users, [(u,) for u in users])
 
     def get_selected_user_name(self):
         item = self.sel_users.get_selected_item()
@@ -1346,16 +1669,32 @@ class SambaManagerApp(Gtk.Application):
 
     def open_password_dialog(self, username):
         b = self.builder.get_object
+        if not username:
+            # smbpasswd -a only works for existing Unix accounts: offer exactly those.
+            existing = set(model_values(self.store_users))
+            candidates = [u for u in SambaUserManager.get_system_users()
+                          if u != 'root' and u not in existing]
+            if not candidates:
+                self.show_alert("No eligible system users",
+                                "Every regular system account already has a Samba user.\n\n"
+                                "Create the Unix account first (e.g. 'sudo adduser NAME'), "
+                                "then add it here.")
+                return
+            set_dropdown_items(b("pass_dropdown_user"), candidates)
         b("password_window").set_title('Set User Password' if username else 'Add Samba User')
         b("pass_entry_user").set_text(username)
-        b("pass_entry_user").set_sensitive(not bool(username))
+        b("pass_entry_user").set_visible(bool(username))
+        b("pass_dropdown_user").set_visible(not username)
         b("pass_entry_pass").set_text("")
         b("pass_entry_confirm").set_text("")
         b("password_window").present()
 
     def on_password_save_clicked(self, widget):
         b = self.builder.get_object
-        user = b("pass_entry_user").get_text().strip()
+        if b("pass_entry_user").get_visible():
+            user = b("pass_entry_user").get_text().strip()
+        else:
+            user = dropdown_text(b("pass_dropdown_user"))
         pw1 = b("pass_entry_pass").get_text()
         pw2 = b("pass_entry_confirm").get_text()
         if not user:
@@ -1399,9 +1738,9 @@ class SambaManagerApp(Gtk.Application):
         b = self.builder.get_object
 
         # Security: user-level unless the file used something else and the user kept it.
-        sec_val = None if (self.keep_security and b("combo_security").get_active() == 1) else "user"
+        sec_val = None if (self.keep_security and dropdown_index(b("combo_security")) == 1) else "user"
 
-        map_idx = b("combo_map_guest").get_active()
+        map_idx = dropdown_index(b("combo_map_guest"))
         map_val = {0: "Never", 1: "Bad User", 2: "Bad Password"}.get(map_idx)   # 3 = keep existing
 
         guest_acc = b("entry_guest_account").get_text().strip() or 'nobody'
@@ -1418,7 +1757,7 @@ class SambaManagerApp(Gtk.Application):
         )
 
         try:
-            backup = self.handler.save_config()
+            result = self.handler.save_config()
         except Exception as e:
             self.show_alert("Error", f"Could not save configuration:\n\n{e}")
             return False
@@ -1427,26 +1766,29 @@ class SambaManagerApp(Gtk.Application):
         fs_errors = self.apply_pending_fs()
         self.refresh_shares_list()
 
-        if not SambaServiceManager.is_running():
+        try:
+            reload_res = HELPER.call('reload_conf')
+        except Exception as e:
+            reload_res = {'status': 'failed', 'detail': str(e)}
+        status, detail = reload_res['status'], reload_res['detail']
+        if status == 'not_running':
             reload_msg = "\n\nNote: Samba daemon is not running. Start the service manually from the Control tab."
+        elif status == 'ok':
+            reload_msg = "\n\nSamba configuration reloaded successfully."
+        elif status == 'missing':
+            reload_msg = "\n\nNote: 'smbcontrol' not found. Cannot auto-reload."
+        elif status == 'timeout':
+            reload_msg = "\n\nWarning: 'smbcontrol' timed out. Restart manually."
         else:
-            try:
-                result = subprocess.run(['smbcontrol', 'all', 'reload-config'],
-                                        capture_output=True, text=True, timeout=30)
-                if result.returncode != 0 or any(err in (result.stdout + result.stderr).lower()
-                                                 for err in ["not found", "failed"]):
-                    reload_msg = "\n\nWarning: 'smbcontrol' failed to reload config. Restart manually."
-                else:
-                    reload_msg = "\n\nSamba configuration reloaded successfully."
-            except FileNotFoundError:
-                reload_msg = "\n\nNote: 'smbcontrol' not found. Cannot auto-reload."
-            except subprocess.TimeoutExpired:
-                reload_msg = "\n\nWarning: 'smbcontrol' timed out. Restart manually."
+            reload_msg = "\n\nWarning: reloading the configuration failed. Restart manually." + \
+                         (f"\n{detail}" if detail else "")
 
         message = f"File written successfully to: {self.handler.filepath}"
-        if backup:
-            message += f"\nBackup: {backup}"
+        if result.get('backup'):
+            message += f"\nBackup: {result['backup']}"
         message += reload_msg
+        if result.get('warnings'):
+            message += "\n\ntestparm warnings:\n" + result['warnings']
         if fs_errors:
             message += "\n\nDirectory problems:\n" + "\n".join(fs_errors)
 
@@ -1457,12 +1799,19 @@ class SambaManagerApp(Gtk.Application):
 
 
 def main():
-    if os.geteuid() != 0:
-        show_root_warning_and_exit()      # exits
+    if '--helper' in sys.argv[1:]:
+        helper_main()
+        return
     if ConfigUpdater is None:
         print("Error: The 'configupdater' module is missing.")
         print("Please install it via: pip install configupdater --break-system-packages")
         sys.exit(1)
+    if os.geteuid() != 0 and shutil.which('pkexec') is None:
+        show_fatal_dialog_and_exit(
+            "Administrator access unavailable",
+            "pkexec (polkit) was not found, so this program cannot get the rights it needs.\n\n"
+            "Install polkit, or launch the program as root:\n"
+            f"sudo -E python3 {os.path.abspath(__file__)}")
     app = SambaManagerApp()
     sys.exit(app.run(None))
 
